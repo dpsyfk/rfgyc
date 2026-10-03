@@ -167,11 +167,11 @@ constexpr unsigned long PRETURN_QUIET_MS = 150;   // encoders must be quiet this
 constexpr int16_t TURN_KICK_PWM      = 150;       // breakaway kick at the start of a turn (also used after a stop / reversal)
 constexpr unsigned long TURN_KICK_MS = 150;       // kick duration, counted from when the outputs have actually reached TURN_KICK_PWM
 constexpr float   TURN_KICK_MIN_ERR_DEG = 10.0f;  // no kick for corrections smaller than this
-constexpr int16_t TURN_ENTRY_PWM     = 130;       // PWM the rate loop starts from right after the kick (>= TURN_MIN_PWM)
-constexpr int16_t TURN_MIN_PWM       = 120;       // floor of the turn PWM (must break away / not stall)
+constexpr int16_t TURN_ENTRY_PWM     = 110;       // PWM the rate loop starts from right after the kick (>= TURN_MIN_PWM)
+constexpr int16_t TURN_MIN_PWM       = 100;       // floor of the turn PWM (must break away / not stall)
 constexpr int16_t TURN_MAX_PWM       = 150;       // ceiling of the turn PWM (<= MAX_PWM)
-constexpr float   TURN_RATE_MAX_DPS  = 40.0f;     // target turn rate far from the target heading
-constexpr float   TURN_RATE_MIN_DPS  = 25.0f;     // target turn rate floor near the target heading (no crawling)
+constexpr float   TURN_RATE_MAX_DPS  = 45.0f;     // target turn rate far from the target heading
+constexpr float   TURN_RATE_MIN_DPS  = 30.0f;     // target turn rate floor near the target heading (no crawling)
 constexpr float   TURN_RATE_KP       = 1.0f;      // target rate = KP * |error|, clamped to [MIN_DPS, MAX_DPS]
 constexpr float   TURN_RATE_KI       = 6.0f;      // PWM per second per dps of rate error (integrating rate loop)
 constexpr float   TURN_TOLERANCE_DEG = 1.5f;      // existing
@@ -180,7 +180,8 @@ constexpr float   TURN_SETTLED_DPS   = 6.0f;
 constexpr unsigned long TURN_DWELL_MS = 150;      // in-tolerance & still for this long -> turn done
 constexpr unsigned long TURN_TIMEOUT_MS = 9000;
 constexpr unsigned long TURN_WATCHDOG_MS = 1500;  // direction/stall watchdog window (was 800)
-constexpr long          TURN_MIN_TICKS   = 100;   // each wheel must count at least this many ticks inside the window
+constexpr long          TURN_MIN_TICKS   = 100;
+constexpr float         TURN_WRONG_WAY_DEG = 15.0f;  // heading moved this far the WRONG way -> stop at once (do not wait for the watchdog window)   // each wheel must count at least this many ticks inside the window
 constexpr uint8_t TURN_MAX_REVERSALS = 3;         // overshoot corrections allowed before giving up
 
 // ---- Bench tools (serial 'm' motor test, 'g' gyro check) ----
@@ -202,7 +203,8 @@ constexpr float   HOLD_MAX_CORR = 35.0f;
 
 // ---- Timeouts / watchdogs ----
 constexpr unsigned long INITIAL_FORWARD_TIMEOUT_MS = 8000;   // covers INITIAL_FORWARD + PRETURN_DECEL
-constexpr unsigned long WALL_APPROACH_TIMEOUT_MS   = 12000;
+constexpr unsigned long WALL_APPROACH_TIMEOUT_MS   = 8000;    // base; plus WALL_TIMEOUT_MS_PER_MM x distance still to travel
+constexpr unsigned long WALL_TIMEOUT_MS_PER_MM     = 30;      // = the robot must average >= ~33 mm/s on the wall approach
 constexpr unsigned long ENCODER_STALL_MS = 500;
 constexpr bool          ENCODER_SINGLE_FAIL_IS_FAULT = true;  // one silent encoder while the other counts -> FAULT
 constexpr float         VEER_FAULT_DEG   = 35.0f;
@@ -234,7 +236,15 @@ constexpr unsigned long TOF_PRIME_TIMEOUT_MS = 2000;
 // ---- Gyro (MPU6050, +/-500 dps) ----
 constexpr float GYRO_LSB_PER_DPS = 65.5f;
 constexpr unsigned long GYRO_INTERVAL_MS = 5;
-constexpr int   GYRO_CAL_MAX_SPREAD = 150;
+// Gyro calibration (robust): the robot must stand still; single I2C glitches are rejected instead of failing the run.
+constexpr int   GYRO_CAL_SAMPLES     = 300;     // ~0.9 s per attempt
+constexpr uint8_t GYRO_CAL_ATTEMPTS  = 5;
+constexpr float GYRO_CAL_OUTLIER     = 120.0f;  // raw counts (~1.8 dps) from the mean: a sample further away is an outlier
+constexpr int   GYRO_CAL_MAX_OUTLIER_PCT = 5;   // more outliers than this = robot moving / vibration
+constexpr float GYRO_CAL_MAX_STD     = 30.0f;   // raw counts (~0.46 dps) std-dev of the good samples
+constexpr float GYRO_CAL_MAX_HALF_DIFF = 40.0f; // raw counts: first half vs second half mean (slow rotation / drift)
+// Multiplies the gyro rate. 1.0 = datasheet scale. After the 'g' 360-degree hand-turn check set it to 360 / (heading shown).
+constexpr float GYRO_SCALE_CORR = 1.0f;
 
 // ---- Loop intervals ----
 constexpr unsigned long CONTROL_INTERVAL_MS   = 10;
@@ -317,7 +327,8 @@ float initialTravelMm = 0.0f, wallApproachTravelMm = 0.0f;
 float finalWallMm = 0.0f, finalHeadingDeg = 0.0f;
 
 unsigned long moveStartMs = 0;        // movement timeout reference (INITIAL_FORWARD + PRETURN_DECEL)
-unsigned long wallStartMs = 0;        // wall-approach timeout reference
+unsigned long wallStartMs = 0;
+unsigned long wallTimeoutMs = WALL_APPROACH_TIMEOUT_MS;   // set per run from the distance still to travel        // wall-approach timeout reference
 bool  brakePhase = false;             // PRETURN_DECEL: false = profiled drive, true = ramp-to-zero wait
 unsigned long brakeStartMs = 0;
 
@@ -482,28 +493,50 @@ bool gyroReadRawZ(int16_t &gz) {
 
 // Average the still-robot reading. Rejects the run if the robot was moving.
 bool gyroCalibrate() {
-  for (uint8_t attempt = 0; attempt < 3; attempt++) {
-    long sum = 0; int good = 0;
-    int16_t mn = 32767, mx = -32768;
-    for (int i = 0; i < 300; i++) {
+  static int16_t buf[GYRO_CAL_SAMPLES];
+  for (uint8_t attempt = 0; attempt < GYRO_CAL_ATTEMPTS; attempt++) {
+    int good = 0;
+    for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
       int16_t gz;
-      if (gyroReadRawZ(gz)) {
-        sum += gz; good++;
-        if (gz < mn) mn = gz;
-        if (gz > mx) mx = gz;
-      }
+      if (gyroReadRawZ(gz)) buf[good++] = gz;
       delay(3);
     }
-    if (good < 250) { Serial.println(F("[GYRO] calibration: too many failed reads")); continue; }
-    if ((int)(mx - mn) > GYRO_CAL_MAX_SPREAD) {
-      Serial.println(F("[GYRO] calibration: robot was moving, retrying"));
+    if (good < (GYRO_CAL_SAMPLES * 5) / 6) { Serial.println(F("[GYRO] calibration: too many failed reads, retrying")); continue; }
+
+    // pass 1: mean of everything; pass 2: mean of the samples near it (drops I2C glitches / bumps)
+    float mean = 0;
+    for (int i = 0; i < good; i++) mean += buf[i];
+    mean /= good;
+    for (uint8_t pass = 0; pass < 2; pass++) {
+      float s1 = 0; int n = 0;
+      for (int i = 0; i < good; i++) if (fabsf((float)buf[i] - mean) <= GYRO_CAL_OUTLIER) { s1 += buf[i]; n++; }
+      if (n == 0) break;
+      mean = s1 / n;
+    }
+    int n = 0, outliers = 0;
+    float var = 0, h1 = 0, h2 = 0; int n1 = 0, n2 = 0;
+    for (int i = 0; i < good; i++) {
+      float d = (float)buf[i] - mean;
+      if (fabsf(d) > GYRO_CAL_OUTLIER) { outliers++; continue; }
+      n++; var += d * d;
+      if (i < good / 2) { h1 += buf[i]; n1++; } else { h2 += buf[i]; n2++; }
+    }
+    if (n < good / 2) { Serial.println(F("[GYRO] calibration: robot is moving (most samples far from the mean), retrying")); continue; }
+    float sd = sqrtf(var / n);
+    float halfDiff = (n1 > 0 && n2 > 0) ? fabsf(h1 / n1 - h2 / n2) : 0.0f;
+    if (outliers * 100 > good * GYRO_CAL_MAX_OUTLIER_PCT || sd > GYRO_CAL_MAX_STD || halfDiff > GYRO_CAL_MAX_HALF_DIFF) {
+      Serial.print(F("[GYRO] calibration: not still enough (outliers=")); Serial.print(outliers);
+      Serial.print(F(" std=")); Serial.print(sd, 1); Serial.print(F(" halfDiff=")); Serial.print(halfDiff, 1);
+      Serial.println(F("), retrying - keep the robot still and the motors off"));
       continue;
     }
-    gyroBiasZ = (float)sum / good;
+    gyroBiasZ = mean;
     gyroRateZDps = 0.0f;
     lastGyroUs = micros();
     lastGyroReadMs = millis();
-    Serial.print(F("[GYRO] bias Z = ")); Serial.println(gyroBiasZ, 1);
+    Serial.print(F("[GYRO] bias Z = ")); Serial.print(gyroBiasZ, 1);
+    Serial.print(F(" counts (std=")); Serial.print(sd, 1);
+    Serial.print(F(", outliers=")); Serial.print(outliers); Serial.print('/'); Serial.print(good); Serial.println(')');
     return true;
   }
   lastGyroUs = micros();
@@ -526,7 +559,9 @@ bool gyroBegin() {
   gyroWriteReg(0x19, 0x04);                      // 200 Hz sample rate
   gyroWriteReg(0x1B, 0x08);                      // +/-500 dps
   delay(20);
-  Serial.print(F("[BOOT] Gyro WHO_AM_I=0x")); Serial.println(who, HEX);
+  Serial.print(F("[BOOT] Gyro WHO_AM_I=0x")); Serial.print(who, HEX);
+  Serial.println(who == 0x68 ? F(" (MPU-6050)") : who == 0x70 ? F(" (MPU-6500, register-compatible, OK)") :
+                 who == 0x71 ? F(" (MPU-9250, register-compatible, OK)") : who == 0x72 ? F(" (MPU-6500 clone, register-compatible)") : F(" (unknown chip: check the yaw scale with 'g')"));
   return gyroCalibrate();
 }
 
@@ -613,7 +648,7 @@ void gyroUpdate(unsigned long nowMs) {
   float dt = (nowUs - lastGyroUs) * 1e-6f;
   lastGyroUs = nowUs;
   if (dt > 0.2f) dt = 0.2f;
-  float rate = GYRO_YAW_SIGN * ((float)gz - gyroBiasZ) / GYRO_LSB_PER_DPS;
+  float rate = GYRO_YAW_SIGN * GYRO_SCALE_CORR * ((float)gz - gyroBiasZ) / GYRO_LSB_PER_DPS;
   if (fabsf(rate) < 0.3f) rate = 0.0f;
   gyroRateZDps = rate;
   headingDeg += rate * dt;
@@ -1112,6 +1147,7 @@ void startLeftTurn() {
   Serial.print(F("[TURN] base=")); Serial.print(turnBaseDeg, 1);
   Serial.print(F(" target=")); Serial.print(turnTargetDeg, 1);
   Serial.print(F(" (")); Serial.print(QUARANTINE_LEFT_TURN_DEG, 1); Serial.println(F(" deg left)"));
+  Serial.println(F("[TURN] WATCH THE ROBOT: it must rotate LEFT (counter-clockwise seen from above)."));
   enterState(S_LEFT_TURN);
 }
 
@@ -1130,6 +1166,23 @@ void finishTurn() {
 // rate is proportional to the heading error but clamped to [TURN_RATE_MIN_DPS, TURN_RATE_MAX_DPS], and the PWM is
 // clamped to [TURN_MIN_PWM, TURN_MAX_PWM]. So the robot slows down smoothly near the target without crawling at a
 // PWM floor chosen for the slowest case. The lead-stop / tolerance / reversal logic is unchanged.
+static inline float rateTgtHold(float err) { return clampf(TURN_RATE_KP * fabsf(err), TURN_RATE_MIN_DPS, TURN_RATE_MAX_DPS); }
+
+// The heading went the wrong way during a commanded LEFT pivot. Print everything needed to decide which flag is wrong.
+void turnWrongWayFault(float moved) {
+  uint32_t aL, dL, aR, dR;
+  noInterrupts(); aL = encAgreeL; dL = encDisL; aR = encAgreeR; dR = encDisR; interrupts();
+  Serial.print(F("[TURN] heading moved ")); Serial.print(moved, 1);
+  Serial.print(F(" deg the WRONG way. Encoder B vs command: L agree/dis=")); Serial.print(aL); Serial.print('/'); Serial.print(dL);
+  Serial.print(F("  R agree/dis=")); Serial.print(aR); Serial.print('/'); Serial.println(dR);
+  Serial.println(F("[TURN] DIAGNOSIS - the command was: left wheel BACKWARD, right wheel FORWARD (a LEFT pivot). Which way did the robot REALLY turn?"));
+  Serial.println(F("  It turned RIGHT (clockwise)  -> both motors spin backwards: swap the motor leads of BOTH motors, or set invertLeftDir=true AND invertRightDir=false."));
+  Serial.println(F("                                  ('B reversed' on both wheels above supports this.)"));
+  Serial.println(F("  It turned LEFT (as intended) -> the gyro axis is inverted: set GYRO_YAW_SIGN=+1;"));
+  Serial.println(F("                                  if both wheels also say 'B reversed', flip LEFT_FORWARD_SIGN and RIGHT_FORWARD_SIGN too."));
+  stopWithFault("GYRO INVALID: heading moves the wrong way during the left turn (see the DIAGNOSIS lines above)");
+}
+
 void updateTurn(unsigned long now) {
   float err  = turnTargetDeg - headingDeg;
   float rate = gyroRateZDps;
@@ -1138,6 +1191,12 @@ void updateTurn(unsigned long now) {
     if (fabsf(err) <= 5.0f) { finishTurn(); return; }
     stopWithFault("GYRO TURN TIMEOUT: left turn did not reach the target heading in time");
     return;
+  }
+
+  // Early wrong-way stop: do not let the robot spin a hundred degrees before the watchdog window ends.
+  if (fabsf(turnInitialErr) > 5.0f && now - stateStartMs > 150) {
+    float movedNow = (headingDeg - turnHeading0) * (turnInitialErr > 0 ? 1.0f : -1.0f);
+    if (movedNow <= -TURN_WRONG_WAY_DEG) { turnWrongWayFault(movedNow); return; }
   }
 
   // Direction/stall watchdog: inside the first TURN_WATCHDOG_MS the heading must move the right way.
@@ -1155,7 +1214,7 @@ void updateTurn(unsigned long now) {
       else if (fabsf(moved) < 1.0f)
         stopWithFault("GYRO INVALID: wheels spin but heading does not change (robot lifted or gyro not responding)");
       else if (moved <= -1.0f)
-        stopWithFault("GYRO INVALID: heading moves the wrong way (check GYRO_YAW_SIGN / motor direction flags)");
+        turnWrongWayFault(moved);
       else
         stopWithFault("GYRO TURN TIMEOUT: turn far too slow (heading moved < 2 deg in the watchdog window; raise TURN_MIN_PWM / TURN_KICK_PWM)");
       return;
@@ -1209,8 +1268,9 @@ void updateTurn(unsigned long now) {
       turnKickActive = false;
   } else {
     float absRate = rate * (float)sign;                // rate in the direction we want to turn
-    if (absRate < 0.0f) absRate = 0.0f;
-    float rateTgt = clampf(TURN_RATE_KP * fabsf(err), TURN_RATE_MIN_DPS, TURN_RATE_MAX_DPS);
+    bool wrongWay = absRate < 0.0f;                    // no integrator wind-up while the heading moves backwards
+    if (wrongWay) absRate = rateTgtHold(err);
+    float rateTgt = rateTgtHold(err);
     turnPwmCmd += TURN_RATE_KI * (rateTgt - absRate) * (CONTROL_INTERVAL_MS * 0.001f);
     turnPwmCmd = clampf(turnPwmCmd, (float)TURN_MIN_PWM, (float)TURN_MAX_PWM);
     mag = turnPwmCmd;
@@ -1237,7 +1297,7 @@ void updateTurnSettle(unsigned long now) {
   Serial.print(F(" deg, wall at ")); Serial.print(tofFiltMm);
   Serial.print(F(" mm, to travel ~")); Serial.print(need, 0); Serial.println(F(" mm"));
   if (need < -WALL_DISTANCE_TOLERANCE_MM) {
-    stopWithFault("WALL OVERSHOOT: wall is already closer than QUARANTINE_WALL_TARGET_MM before the approach starts (check turn angle / initial travel)");
+    stopWithFault("WALL OVERSHOOT: wall is already closer than QUARANTINE_WALL_TARGET_MM before the approach starts (check turn angle / initial travel; a ToF that reads the same while the robot rotates is looking at part of the robot)");
     return;
   }
   if (need > MAX_WALL_APPROACH_MM) {
@@ -1247,6 +1307,7 @@ void updateTurnSettle(unsigned long now) {
   driveHealthReset(now);
   speedReset();
   wallStartMs = now;
+  wallTimeoutMs = WALL_APPROACH_TIMEOUT_MS + (unsigned long)(need > 0.0f ? need : 0.0f) * WALL_TIMEOUT_MS_PER_MM;
   wallStartFiltMm = (float)tofFiltMm;
   wallConfirmCnt = 0;
   wallConfirmSeq = tofFiltSeq;
@@ -1265,7 +1326,7 @@ int16_t wallBandPwm(float remain) {
 }
 
 void updateWall(unsigned long now) {
-  if (now - wallStartMs > WALL_APPROACH_TIMEOUT_MS) { stopWithFault("WALL APPROACH TIMEOUT: target not reached in time"); return; }
+  if (now - wallStartMs > wallTimeoutMs) { stopWithFault("WALL APPROACH TIMEOUT: target not reached in time"); return; }
   float trav = driveTravelMm();
   if (trav > MAX_WALL_APPROACH_MM) {
     stopWithFault("WALL NOT FOUND: MAX_WALL_APPROACH_MM travelled without reaching the wall target");
@@ -1545,7 +1606,10 @@ const char *readinessCheck() {
 // ============================================================================
 float targetHeadingNow() { return state == S_LEFT_TURN ? turnTargetDeg : holdHeadingDeg; }
 
-float travelNowMm() { return (state >= S_INITIAL_FORWARD && state <= S_QUARANTINE_STOP) ? driveTravelMm() : 0.0f; }
+float travelNowMm() {
+  if (state == S_LEFT_TURN || state == S_TURN_SETTLE) return 0.0f;      // pivot: wheels move opposite ways, 'travel' is meaningless
+  return (state >= S_INITIAL_FORWARD && state <= S_QUARANTINE_STOP) ? driveTravelMm() : 0.0f;
+}
 
 float targetMmNow() {
   if (state <= S_PRETURN_DECEL) return INITIAL_FORWARD_MM;
@@ -1893,7 +1957,8 @@ void printConfigSummary() {
   Serial.print(F(" LEFT_FORWARD_SIGN=")); Serial.print((int)LEFT_FORWARD_SIGN);
   Serial.print(F(" RIGHT_FORWARD_SIGN=")); Serial.print((int)RIGHT_FORWARD_SIGN);
   Serial.print(F(" ENCODER_USE_B_DIRECTION=")); Serial.print(ENCODER_USE_B_DIRECTION ? 1 : 0);
-  Serial.print(F(" GYRO_YAW_SIGN=")); Serial.println(GYRO_YAW_SIGN, 0);
+  Serial.print(F(" GYRO_YAW_SIGN=")); Serial.print(GYRO_YAW_SIGN, 0);
+  Serial.print(F(" GYRO_SCALE_CORR=")); Serial.println(GYRO_SCALE_CORR, 3);
   Serial.print(F("  wheel dia=")); Serial.print(WHEEL_DIAMETER_MM, 0);
   Serial.print(F(" mm, ticks/rev=")); Serial.print(ENCODER_TICKS_REV, 0);
   Serial.println(F("  (existing ESTIMATES, not verified)"));
