@@ -346,6 +346,7 @@ long  turnEncL0 = 0, turnEncR0 = 0;
 uint8_t turnReversals = 0;
 int8_t  turnLastSign = 0;
 uint32_t settleFiltSeq0 = 0;
+uint32_t turnAgreeL0 = 0, turnDisL0 = 0, turnAgreeR0 = 0, turnDisR0 = 0;   // encoder-B counters at turn start
 float   turnPwmCmd = 0.0f;            // rate-loop PWM magnitude
 bool    turnRestart = true;           // next control tick (re)starts from standstill: kick + reset the rate loop
 bool    turnKickActive = false;
@@ -353,7 +354,7 @@ unsigned long turnKickBegin = 0, turnKickT0 = 0;
 uint8_t turnStarts = 0;
 
 // bench tools
-enum BenchMode : uint8_t { BM_NONE, BM_MOTOR, BM_GYRO, BM_ENC };
+enum BenchMode : uint8_t { BM_NONE, BM_MOTOR, BM_GYRO, BM_ENC, BM_DIR };
 BenchMode benchMode = BM_NONE;
 uint8_t benchStep = 0;
 unsigned long benchT0 = 0, benchLastPrintMs = 0;
@@ -361,6 +362,9 @@ long benchTicks0 = 0, benchB0 = 0;
 uint32_t benchEdges0 = 0;
 float benchMaxRate = 0.0f;
 const char *benchResult[4] = {"-", "-", "-", "-"};
+int8_t benchBDir[4] = {0, 0, 0, 0};      // direction encoder B reported per run (after FORWARD_SIGN)
+long   benchA[4] = {0, 0, 0, 0};         // A edges per run
+uint8_t benchBSeen[4] = {0, 0, 0, 0};    // bit0 = B pin read LOW at least once during the run, bit1 = read HIGH (both = B is alive)
 uint32_t benchLastEdges[2] = {0, 0};     // edge counters at the end of the previous run (stray-edge detection)
 uint32_t benchStray = 0;
 bool benchMidPrinted = false;
@@ -1147,6 +1151,7 @@ void startLeftTurn() {
   turnReversals = 0;
   turnLastSign = 0;
   turnRestart = true;                                  // first control tick: kick, then rate loop
+  noInterrupts(); turnAgreeL0 = encAgreeL; turnDisL0 = encDisL; turnAgreeR0 = encAgreeR; turnDisR0 = encDisR; interrupts();
   turnStarts = 0;
   turnKickActive = false;
   turnHeading0 = headingDeg;
@@ -1176,8 +1181,34 @@ void finishTurn() {
 // PWM floor chosen for the slowest case. The lead-stop / tolerance / reversal logic is unchanged.
 static inline float rateTgtHold(float err) { return clampf(TURN_RATE_KP * fabsf(err), TURN_RATE_MIN_DPS, TURN_RATE_MAX_DPS); }
 
+// Per-wheel encoder-B check over the current turn: does each wheel follow its command?
+// Returns 0 = not enough data, 1 = agrees, -1 = reversed, 2 = noisy.
+static int8_t wheelBVerdict(uint32_t agree, uint32_t dis) {
+  uint32_t n = agree + dis;
+  if (n < 30) return 0;
+  uint32_t pct = (agree * 100UL) / n;
+  return pct >= 90 ? 1 : (pct <= 10 ? -1 : 2);
+}
+void turnWheelDiagnosis() {
+  uint32_t aL, dL, aR, dR;
+  noInterrupts(); aL = encAgreeL - turnAgreeL0; dL = encDisL - turnDisL0; aR = encAgreeR - turnAgreeR0; dR = encDisR - turnDisR0; interrupts();
+  int8_t vl = wheelBVerdict(aL, dL), vr = wheelBVerdict(aR, dR);
+  Serial.print(F("[TURN] wheel check (encoder B vs command, this turn): LEFT ")); Serial.print(aL); Serial.print('/'); Serial.print(dL);
+  Serial.print(vl == 1 ? F(" OK") : vl == -1 ? F(" REVERSED") : vl == 2 ? F(" NOISY") : F(" no data"));
+  Serial.print(F(" | RIGHT ")); Serial.print(aR); Serial.print('/'); Serial.print(dR);
+  Serial.println(vr == 1 ? F(" OK") : vr == -1 ? F(" REVERSED") : vr == 2 ? F(" NOISY") : F(" no data"));
+  if ((vl == 1 && vr == -1) || (vl == -1 && vr == 1)) {
+    Serial.print(F("[TURN] ONLY the ")); Serial.print(vl == -1 ? F("LEFT") : F("RIGHT"));
+    Serial.println(F(" wheel is reversed while the other follows its command: its DIR input is dead, OR its encoder B wire is stuck (B then reads reversed whatever the motor does):"));
+    Serial.println(F("       a dead DIR makes both wheels spin the same way (robot drives straight, heading unchanged). Run 'm' (the summary says which) - and remember an unchanged heading is normal on blocks."));
+  } else if (vl == 1 && vr == 1) {
+    Serial.println(F("[TURN] both wheels follow their commands: if the robot is on blocks / lifted, an unchanged heading is expected. On the floor, suspect the gyro."));
+  }
+}
+
 // The heading went the wrong way during a commanded LEFT pivot. Print everything needed to decide which flag is wrong.
 void turnWrongWayFault(float moved) {
+  turnWheelDiagnosis();
   uint32_t aL, dL, aR, dR;
   noInterrupts(); aL = encAgreeL; dL = encDisL; aR = encAgreeR; dR = encDisR; interrupts();
   Serial.print(F("[TURN] heading moved ")); Serial.print(moved, 1);
@@ -1221,12 +1252,14 @@ void updateTurn(unsigned long now) {
       Serial.print(F(" heading moved=")); Serial.print(moved, 1); Serial.println(F(" deg"));
       if (dl < TURN_MIN_TICKS || dr < TURN_MIN_TICKS)
         stopWithFault("ENCODER STALL: wheels not moving (stall, no power or blocked) - check MDD10A motor battery/switch/common GND; see ticks L/R above; run 'm' and 'e'");
-      else if (fabsf(moved) < 1.0f)
-        stopWithFault("GYRO INVALID: wheels spin but heading does not change (robot lifted or gyro not responding)");
+      else if (fabsf(moved) < 1.0f) {
+        turnWheelDiagnosis();
+        stopWithFault("GYRO INVALID: wheels spin but heading does not change (robot lifted / on blocks, one wheel not reversing - see the wheel check above - or gyro not responding)");
+      }
       else if (moved <= -1.0f)
         turnWrongWayFault(moved);
       else
-        stopWithFault("GYRO TURN TIMEOUT: turn far too slow (heading moved < 2 deg in the watchdog window; raise TURN_MIN_PWM / TURN_KICK_PWM)");
+      { turnWheelDiagnosis(); stopWithFault("GYRO TURN TIMEOUT: turn far too slow (heading moved < 2 deg in the watchdog window; raise TURN_MIN_PWM / TURN_KICK_PWM)"); }
       return;
     }
   }
@@ -1801,6 +1834,8 @@ void handleWirelessClients() {
 //        commanded direction, the A-edge count and what encoder B says the physical direction was. PUT THE ROBOT ON BLOCKS.
 //  'e' = raw encoder monitor (MOTORS STAY OFF): prints the A/B pin levels and edge counts 4x per second; turn each wheel
 //        by hand to prove the encoder wiring independently of the motors / MDD10A power.
+//  'd' = DIR pin test (MOTORS STAY OFF, PWM 0): D6 and D10 toggle LOW/HIGH every 2 s; measure the MDD10A DIR1 / DIR2 terminals
+//        with a multimeter (they must follow, 0 V <-> 5 V). Proves the DIR wires and pins independent of the motors.
 //  'g' = gyro scale check: heading is zeroed and printed 4x per second; turn the robot by hand (left = positive).
 //  any key while a bench tool runs aborts it. After a bench tool the robot stays stopped: reset to run the mission.
 const char *dirName(int8_t d) { return d > 0 ? "FORWARD" : (d < 0 ? "BACKWARD" : "none"); }
@@ -1835,6 +1870,9 @@ void benchStart(BenchMode m) {
   if (m == BM_MOTOR) {
     Serial.println(F("\n[BENCH] MOTOR TEST in 2 s: each wheel spins alone, FORWARD then BACKWARD, 1 s at 180 PWM."));
     Serial.println(F("[BENCH] ROBOT MUST BE ON BLOCKS. Send any key to abort. Watch which way each wheel really turns."));
+  } else if (m == BM_DIR) {
+    Serial.println(F("\n[BENCH] DIR PIN TEST (motors off, PWM 0): D6 and D10 go LOW, HIGH, LOW, HIGH, 2 s each."));
+    Serial.println(F("[BENCH] Put a multimeter (DC volts) between MDD10A GND and the DIR1 terminal, then DIR2. Each must follow D6 / D10."));
   } else if (m == BM_ENC) {
     noInterrupts(); benchTicks0 = (long)encEdgesL; benchB0 = (long)encEdgesR; interrupts();   // reused as start counts
     Serial.println(F("\n[BENCH] ENCODER MONITOR (motors stay OFF). Turn each wheel by hand, forward and backward."));
@@ -1863,6 +1901,7 @@ void benchReport(uint8_t seg) {
   else if (bDir == cmd) verdict = "B OK";
   else verdict = "B REVERSED";
   benchResult[seg] = verdict;
+  benchBDir[seg] = bDir; benchA[seg] = dA;
   noInterrupts(); benchLastEdges[0] = encEdgesL; benchLastEdges[1] = encEdgesR; interrupts();
   Serial.print(F("[MOTOR TEST] ")); Serial.print(wheel == 0 ? F("LEFT  (D5/D6, invertLeftDir=") : F("RIGHT (D9/D10, invertRightDir="));
   Serial.print((wheel == 0 ? invertLeftDir : invertRightDir) ? 1 : 0);
@@ -1873,6 +1912,31 @@ void benchReport(uint8_t seg) {
   Serial.print(F("  B says ")); Serial.print(dirName(bDir));
   Serial.print(F(" (expected ")); Serial.print(dirName(cmd));
   Serial.print(F(")  -> ")); Serial.println(verdict);
+}
+
+// Per wheel: compare what encoder B reported for FORWARD and for BACKWARD. A healthy wheel reports opposite directions.
+void benchSummary() {
+  Serial.println(F("[MOTOR TEST] SUMMARY (per wheel, from the FORWARD run and the BACKWARD run):"));
+  for (uint8_t w = 0; w < 2; w++) {
+    int8_t bf = benchBDir[2 * w], bb = benchBDir[2 * w + 1];
+    long af = benchA[2 * w], ab = benchA[2 * w + 1];
+    Serial.print(F("  ")); Serial.print(w == 0 ? F("LEFT : ") : F("RIGHT: "));
+    if (af < 20 || ab < 20) Serial.println(F("NO TICKS in at least one run -> wheel not turning (power / driver / motor lead) or encoder A dead."));
+    else if (bf == 0 || bb == 0) Serial.println(F("B signal unreadable -> check the B wire."));
+    else if (bf == bb) {
+      bool bAlive = (benchBSeen[2 * w] == 3) || (benchBSeen[2 * w + 1] == 3);
+      if (!bAlive) {
+        Serial.print(w == 0 ? F("B PIN STUCK at one level (never toggled while the wheel spun) -> encoder B wire D7 dead / floating / shorted, or the encoder's B output is dead. ")
+                            : F("B PIN STUCK at one level (never toggled while the wheel spun) -> encoder B wire D4 dead / floating / shorted, or the encoder's B output is dead. "));
+        Serial.println(F("The motor itself may be fine: B is only a diagnostic here (counting uses A)."));
+      } else {
+        Serial.println(w == 0 ? F("DOES NOT REVERSE: B toggles, but the wheel spins the SAME way for FORWARD and BACKWARD -> DIR input not working: check D6 -> MDD10A DIR1, the connector, the MDD10A channel (use 'd' + a multimeter).")
+                              : F("DOES NOT REVERSE: B toggles, but the wheel spins the SAME way for FORWARD and BACKWARD -> DIR input not working: check D10 -> MDD10A DIR2, the connector, the MDD10A channel (use 'd' + a multimeter)."));
+      }
+    }
+    else if (bf == 1 && bb == -1) Serial.println(F("OK: reverses correctly and B agrees with the command."));
+    else Serial.println(F("reverses, but B says the OPPOSITE of the command in BOTH runs -> if the wheel visibly turned the wrong way flip its invert flag, otherwise flip its *_FORWARD_SIGN."));
+  }
 }
 
 void updateBench(unsigned long now) {
@@ -1904,6 +1968,22 @@ void updateBench(unsigned long now) {
     return;
   }
 
+  if (benchMode == BM_DIR) {                           // PWM stays 0; only the DIR pins move
+    setMotors(0, 0);
+    unsigned long el = now - benchT0;
+    uint8_t phase = (uint8_t)(el / 2000);              // 0 LOW, 1 HIGH, 2 LOW, 3 HIGH, then done
+    if (phase >= 4) { benchFinish("DIR pin test complete"); return; }
+    int lvl = (phase % 2) ? HIGH : LOW;
+    if (benchStep != phase + 1) {
+      benchStep = phase + 1;
+      digitalWrite(PIN_DIR_LEFT, lvl); digitalWrite(PIN_DIR_RIGHT, lvl);
+      Serial.print(F("[DIR TEST] D6 (-> MDD10A DIR1) = ")); Serial.print(digitalRead(PIN_DIR_LEFT) ? "HIGH" : "LOW");
+      Serial.print(F("   D10 (-> MDD10A DIR2) = ")); Serial.print(digitalRead(PIN_DIR_RIGHT) ? "HIGH" : "LOW");
+      Serial.println(F("   <- measure the MDD10A DIR1 / DIR2 terminals now (expect ~0 V / ~5 V)"));
+    }
+    return;
+  }
+
   // BM_MOTOR: step 0 = start delay, then (run, pause) x 4 = L fwd, L back, R fwd, R back
   unsigned long el = now - benchT0;
   if (benchStep == 0) {
@@ -1911,6 +1991,7 @@ void updateBench(unsigned long now) {
     if (el >= BENCH_START_DELAY_MS) {
       Serial.print(F("[MOTOR TEST] encoder pins now: L A=")); Serial.print(digitalRead(PIN_ENC_L_A)); Serial.print(F(" B=")); Serial.print(digitalRead(PIN_ENC_L_B));
       Serial.print(F(" | R A=")); Serial.print(digitalRead(PIN_ENC_R_A)); Serial.print(F(" B=")); Serial.println(digitalRead(PIN_ENC_R_B));
+      for (uint8_t i = 0; i < 4; i++) benchBSeen[i] = 0;
       benchStep = 1; benchT0 = now; benchSnapshot(0);
     }
     return;
@@ -1921,6 +2002,7 @@ void updateBench(unsigned long now) {
     int8_t cmd = (seg % 2 == 0) ? 1 : -1;
     int16_t p = (int16_t)(cmd * BENCH_MOTOR_PWM);
     if (seg / 2 == 0) setMotors(p, 0); else setMotors(0, p);
+    benchBSeen[seg] |= (digitalRead(seg / 2 == 0 ? PIN_ENC_L_B : PIN_ENC_R_B) == HIGH) ? 2 : 1;   // B must toggle while the wheel spins
     if (!benchMidPrinted && el >= BENCH_RUN_MS / 2) {            // proves what the sketch is actually commanding
       benchMidPrinted = true;
       Serial.print(F("[MOTOR TEST]   mid-run live PWM L=")); Serial.print(liveLeftPwm);
@@ -1932,6 +2014,7 @@ void updateBench(unsigned long now) {
     if (el >= BENCH_PAUSE_MS) {
       if (seg >= 3) {
         printEncDiag();
+        benchSummary();
         Serial.println(F("[MOTOR TEST] HOW TO READ THIS:"));
         Serial.println(F("  - Wheel physically turned the WRONG way for 'FORWARD'  -> flip that motor's invert flag (invertLeftDir / invertRightDir)."));
         Serial.println(F("  - Wheel turned the right way but B says REVERSED on BOTH its runs -> flip that wheel's *_FORWARD_SIGN."));
@@ -1950,10 +2033,10 @@ void serialCommands() {
     int c = Serial.read();
     if (c == '\r' || c == '\n' || c == ' ') continue;
     if (state == S_BENCH_TEST && benchMode != BM_NONE) { benchFinish("aborted by serial input"); continue; }
-    if (c == 'm' || c == 'g' || c == 'e') {
+    if (c == 'm' || c == 'g' || c == 'e' || c == 'd') {
       bool ok = (state == S_START_COUNTDOWN || state == S_QUARANTINE_READY || state == S_FAULT || state == S_BENCH_TEST);
       if (!ok) { Serial.println(F("[CMD] refused: bench tools run only before MISSION START or when the robot is stopped")); continue; }
-      benchStart(c == 'm' ? BM_MOTOR : (c == 'e' ? BM_ENC : BM_GYRO));
+      benchStart(c == 'm' ? BM_MOTOR : (c == 'e' ? BM_ENC : (c == 'd' ? BM_DIR : BM_GYRO)));
     }
   }
 }
@@ -2053,7 +2136,7 @@ void setup() {
     Serial.print(F("[WIFI] http://")); Serial.println(WiFi.localIP());
   }
   printConfigSummary();
-  Serial.println(F("[BOOT] serial commands before MISSION START: 'm' = motor/encoder-B test (robot on blocks), 'g' = gyro scale check, 'e' = raw encoder monitor (motors off)"));
+  Serial.println(F("[BOOT] serial commands before MISSION START: 'm' = motor/encoder-B test (robot on blocks), 'g' = gyro scale check, 'e' = raw encoder monitor (motors off), 'd' = DIR pin test (motors off)"));
 
   // 10-11. Readiness; any failure latches FAULT without moving.
   state = S_READY_CHECK;
