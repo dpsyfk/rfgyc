@@ -142,7 +142,7 @@ constexpr float WALL_FINE_ZONE_MM   = 100.0f;  // inside this: CRAWL (state WALL
 
 // ---- Wall confirmation ----
 constexpr float   WALL_STOP_LEAD_MM         = 5.0f;   // fixed part of the stop lead
-constexpr float   WALL_STOP_LATENCY_S       = 0.20f;  // speed-dependent part: lead += closing speed x this (ToF filter + confirm + brake ramp).
+constexpr float   WALL_STOP_LATENCY_S       = 0.32f;  // speed-dependent part: lead += closing speed x this (ToF filter + confirm + brake ramp).
                                                       // The stop trigger is  target + LEAD + speed x LATENCY, so a heavier / faster robot stops earlier.
                                                       // TUNE from the [STOP] line: error < 0 (too close) -> raise LATENCY_S; error > 0 (short) -> lower it.
 constexpr uint8_t WALL_CONFIRM_COUNT        = 3;      // consecutive NEW filtered samples at/below the trigger
