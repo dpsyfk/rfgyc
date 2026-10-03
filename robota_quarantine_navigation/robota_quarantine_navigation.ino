@@ -77,8 +77,11 @@ constexpr uint8_t PIN_PWM_LEFT    = 5;
 constexpr uint8_t PIN_DIR_LEFT    = 6;
 constexpr uint8_t PIN_PWM_RIGHT   = 9;
 constexpr uint8_t PIN_DIR_RIGHT   = 10;
-bool invertLeftDir  = false;
-bool invertRightDir = true;          // opposite-facing gearboxes
+// FLIPPED after the motor wiring was redone: with the old values (false/true) a commanded LEFT pivot made the gyro heading
+// go NEGATIVE and encoder B disagreed with the command on 100% of the edges on BOTH wheels = both motors spin backwards.
+// If the robot now visibly turns RIGHT on the first run, set these back to false / true and read the TURN diagnosis.
+bool invertLeftDir  = true;
+bool invertRightDir = false;         // opposite-facing gearboxes
 
 // Encoders (A = interrupt pin, counted on RISING). "LEFT"/"RIGHT" = the MOTOR CHANNEL (see the
 // working sketch: the D3/D7 encoder sits on the D5/D6 motor, the D2/D4 encoder on the D9/D10 motor).
@@ -125,12 +128,12 @@ constexpr float QUARANTINE_WALL_TARGET_MM  = 280.0f;  // OUR navigation strategy
 constexpr float MAX_WALL_APPROACH_MM       = 800.0f;  // PLACEHOLDER: max encoder travel after the turn before "WALL NOT FOUND"
 
 // ---- Speeds (PWM 0..255; below ~80 the wheels stall) ----
-constexpr int16_t INITIAL_CRUISE_PWM = 110;   // PLACEHOLDER
-constexpr int16_t WALL_FAST_PWM      = 120;   // PLACEHOLDER
-constexpr int16_t WALL_MEDIUM_PWM    = 100;   // PLACEHOLDER
-constexpr int16_t WALL_SLOW_PWM      = 90;    // PLACEHOLDER
-constexpr int16_t WALL_CRAWL_PWM     = 80;    // PLACEHOLDER
-constexpr int16_t WALL_MIN_PWM       = 80;    // lowest forward PWM ever commanded during the wall approach
+constexpr int16_t INITIAL_CRUISE_PWM = 140;   // PLACEHOLDER
+constexpr int16_t WALL_FAST_PWM      = 150;   // PLACEHOLDER
+constexpr int16_t WALL_MEDIUM_PWM    = 130;   // PLACEHOLDER
+constexpr int16_t WALL_SLOW_PWM      = 115;   // PLACEHOLDER
+constexpr int16_t WALL_CRAWL_PWM     = 105;   // PLACEHOLDER
+constexpr int16_t WALL_MIN_PWM       = 100;   // lowest forward PWM ever commanded during the wall approach
 
 // ---- Wall-approach speed zones (distance ABOVE QUARANTINE_WALL_TARGET_MM; PLACEHOLDERS) ----
 constexpr float WALL_MEDIUM_ZONE_MM = 450.0f;  // above this: FAST
@@ -138,7 +141,10 @@ constexpr float WALL_SLOW_ZONE_MM   = 250.0f;  // above this: MEDIUM, below: SLO
 constexpr float WALL_FINE_ZONE_MM   = 100.0f;  // inside this: CRAWL (state WALL_FINE_APPROACH)
 
 // ---- Wall confirmation ----
-constexpr float   WALL_STOP_LEAD_MM         = 8.0f;   // PLACEHOLDER: stop trigger = target + lead (covers travel during confirm + braking)
+constexpr float   WALL_STOP_LEAD_MM         = 5.0f;   // fixed part of the stop lead
+constexpr float   WALL_STOP_LATENCY_S       = 0.20f;  // speed-dependent part: lead += closing speed x this (ToF filter + confirm + brake ramp).
+                                                      // The stop trigger is  target + LEAD + speed x LATENCY, so a heavier / faster robot stops earlier.
+                                                      // TUNE from the [STOP] line: error < 0 (too close) -> raise LATENCY_S; error > 0 (short) -> lower it.
 constexpr uint8_t WALL_CONFIRM_COUNT        = 3;      // consecutive NEW filtered samples at/below the trigger
 constexpr float   WALL_DISTANCE_TOLERANCE_MM = 10.0f; // accepted final window: target +/- this
 
@@ -146,7 +152,7 @@ constexpr float   WALL_DISTANCE_TOLERANCE_MM = 10.0f; // accepted final window: 
 constexpr bool  ALLOW_OVERSHOOT_REVERSE_CORRECTION = false;  // false = stop, report, latch FAULT (recommended for first tests)
 constexpr float WALL_OVERSHOOT_MAX_CORRECT_MM = 25.0f;       // only used when the option above is true
 constexpr float WALL_REVERSE_MAX_MM           = 30.0f;
-constexpr int16_t WALL_REVERSE_PWM            = 85;
+constexpr int16_t WALL_REVERSE_PWM            = 110;
 constexpr unsigned long WALL_REVERSE_TIMEOUT_MS = 3000;
 
 // ---- Timing ----
@@ -164,12 +170,12 @@ constexpr unsigned long PRETURN_QUIET_MS = 150;   // encoders must be quiet this
 
 // ---- Gyro turn ----
 // Turn controller: breakaway kick, then a rate-regulated slow turn (see updateTurn()).
-constexpr int16_t TURN_KICK_PWM      = 150;       // breakaway kick at the start of a turn (also used after a stop / reversal)
-constexpr unsigned long TURN_KICK_MS = 150;       // kick duration, counted from when the outputs have actually reached TURN_KICK_PWM
+constexpr int16_t TURN_KICK_PWM      = 190;       // breakaway kick at the start of a turn (also used after a stop / reversal)
+constexpr unsigned long TURN_KICK_MS = 200;       // kick duration, counted from when the outputs have actually reached TURN_KICK_PWM
 constexpr float   TURN_KICK_MIN_ERR_DEG = 10.0f;  // no kick for corrections smaller than this
-constexpr int16_t TURN_ENTRY_PWM     = 110;       // PWM the rate loop starts from right after the kick (>= TURN_MIN_PWM)
-constexpr int16_t TURN_MIN_PWM       = 100;       // floor of the turn PWM (must break away / not stall)
-constexpr int16_t TURN_MAX_PWM       = 150;       // ceiling of the turn PWM (<= MAX_PWM)
+constexpr int16_t TURN_ENTRY_PWM     = 130;       // PWM the rate loop starts from right after the kick (>= TURN_MIN_PWM)
+constexpr int16_t TURN_MIN_PWM       = 110;       // floor of the turn PWM (must break away / not stall)
+constexpr int16_t TURN_MAX_PWM       = 180;       // ceiling of the turn PWM (<= MAX_PWM)
 constexpr float   TURN_RATE_MAX_DPS  = 45.0f;     // target turn rate far from the target heading
 constexpr float   TURN_RATE_MIN_DPS  = 30.0f;     // target turn rate floor near the target heading (no crawling)
 constexpr float   TURN_RATE_KP       = 1.0f;      // target rate = KP * |error|, clamped to [MIN_DPS, MAX_DPS]
@@ -185,18 +191,18 @@ constexpr float         TURN_WRONG_WAY_DEG = 15.0f;  // heading moved this far t
 constexpr uint8_t TURN_MAX_REVERSALS = 3;         // overshoot corrections allowed before giving up
 
 // ---- Bench tools (serial 'm' motor test, 'g' gyro check) ----
-constexpr int16_t BENCH_MOTOR_PWM = 150;
+constexpr int16_t BENCH_MOTOR_PWM = 180;
 constexpr unsigned long BENCH_START_DELAY_MS = 2000;
 constexpr unsigned long BENCH_RUN_MS   = 1000;
 constexpr unsigned long BENCH_PAUSE_MS = 600;
 
 // ---- Straight driving ----
-constexpr int16_t MAX_PWM       = 165;
-constexpr int16_t MIN_DRIVE_PWM = 80;
-constexpr int16_t DRIVE_KICK_PWM = 150;           // breakaway kick when a straight drive starts from standstill
-constexpr unsigned long DRIVE_KICK_MS = 150;      // 0 = no kick (previous behaviour)
+constexpr int16_t MAX_PWM       = 200;     // raised from 165 for the heavy (~1.5 kg) robot; 200/255 = 78 % duty
+constexpr int16_t MIN_DRIVE_PWM = 100;
+constexpr int16_t DRIVE_KICK_PWM = 190;           // breakaway kick when a straight drive starts from standstill
+constexpr unsigned long DRIVE_KICK_MS = 200;      // 0 = no kick (previous behaviour)
 constexpr float   DRIVE_ACCEL_PWM_PER_S = 160.0f; // speed-command ramp up
-constexpr float   DRIVE_DECEL_PWM_PER_S = 300.0f; // speed-command ramp down
+constexpr float   DRIVE_DECEL_PWM_PER_S = 400.0f; // speed-command ramp down
 constexpr float   HOLD_KP       = 3.0f;           // existing heading hold
 constexpr float   HOLD_KD       = 0.35f;
 constexpr float   HOLD_MAX_CORR = 35.0f;
@@ -374,6 +380,8 @@ unsigned long driveKickBegin = 0, driveKickT0 = 0;
 
 // wall approach
 float wallStartFiltMm = 0.0f;
+float wallSpeedMmS = 0.0f, wallPrevTrav = 0.0f;   // closing speed from the encoders (smoothed)
+unsigned long wallPrevMs = 0;
 uint8_t wallConfirmCnt = 0;
 uint32_t wallConfirmSeq = 0;
 unsigned long wallInvalidSince = 0;
@@ -1176,7 +1184,9 @@ void turnWrongWayFault(float moved) {
   Serial.print(F(" deg the WRONG way. Encoder B vs command: L agree/dis=")); Serial.print(aL); Serial.print('/'); Serial.print(dL);
   Serial.print(F("  R agree/dis=")); Serial.print(aR); Serial.print('/'); Serial.println(dR);
   Serial.println(F("[TURN] DIAGNOSIS - the command was: left wheel BACKWARD, right wheel FORWARD (a LEFT pivot). Which way did the robot REALLY turn?"));
-  Serial.println(F("  It turned RIGHT (clockwise)  -> both motors spin backwards: swap the motor leads of BOTH motors, or set invertLeftDir=true AND invertRightDir=false."));
+  Serial.print(F("  Current flags: invertLeftDir=")); Serial.print(invertLeftDir ? 1 : 0);
+  Serial.print(F(" invertRightDir=")); Serial.println(invertRightDir ? 1 : 0);
+  Serial.println(F("  It turned RIGHT (clockwise)  -> both motors spin backwards: FLIP BOTH invert flags (or swap the motor leads of BOTH motors)."));
   Serial.println(F("                                  ('B reversed' on both wheels above supports this.)"));
   Serial.println(F("  It turned LEFT (as intended) -> the gyro axis is inverted: set GYRO_YAW_SIGN=+1;"));
   Serial.println(F("                                  if both wheels also say 'B reversed', flip LEFT_FORWARD_SIGN and RIGHT_FORWARD_SIGN too."));
@@ -1310,6 +1320,7 @@ void updateTurnSettle(unsigned long now) {
   wallTimeoutMs = WALL_APPROACH_TIMEOUT_MS + (unsigned long)(need > 0.0f ? need : 0.0f) * WALL_TIMEOUT_MS_PER_MM;
   wallStartFiltMm = (float)tofFiltMm;
   wallConfirmCnt = 0;
+  wallSpeedMmS = 0.0f; wallPrevTrav = 0.0f; wallPrevMs = now;
   wallConfirmSeq = tofFiltSeq;
   wallInvalidSince = 0;
   enterState(S_WALL_APPROACH);
@@ -1342,6 +1353,11 @@ void updateWall(unsigned long now) {
   }
   wallInvalidSince = 0;
   if (!driveHealthy(now)) return;
+  if (now - wallPrevMs >= 40) {                        // closing speed from the encoders, smoothed
+    float v = (trav - wallPrevTrav) * 1000.0f / (float)(now - wallPrevMs);
+    wallSpeedMmS += 0.3f * (v - wallSpeedMmS);
+    wallPrevTrav = trav; wallPrevMs = now;
+  }
 
   // The ToF must close on the wall while we drive (guards against a sensor looking at the robot / a side wall).
   if (trav > WALL_PROGRESS_AFTER_MM && (wallStartFiltMm - (float)tofFiltMm) < WALL_PROGRESS_MIN * trav) {
@@ -1354,10 +1370,17 @@ void updateWall(unsigned long now) {
   // Confirm the stop condition on NEW filtered samples only.
   if (tofFiltSeq != wallConfirmSeq) {
     wallConfirmSeq = tofFiltSeq;
-    if ((float)tofFiltMm <= QUARANTINE_WALL_TARGET_MM + WALL_STOP_LEAD_MM) wallConfirmCnt++;
+    float trigger = QUARANTINE_WALL_TARGET_MM + WALL_STOP_LEAD_MM + (wallSpeedMmS > 0.0f ? wallSpeedMmS : 0.0f) * WALL_STOP_LATENCY_S;
+    if ((float)tofFiltMm <= trigger) wallConfirmCnt++;
     else wallConfirmCnt = 0;
   }
-  if (wallConfirmCnt >= WALL_CONFIRM_COUNT) { enterQuarantineStop(); return; }
+  if (wallConfirmCnt >= WALL_CONFIRM_COUNT) {
+    Serial.print(F("[WALL] stop confirmed: filtered=")); Serial.print(tofFiltMm);
+    Serial.print(F(" mm  closing speed=")); Serial.print(wallSpeedMmS, 0);
+    Serial.print(F(" mm/s  trigger was ")); Serial.print(QUARANTINE_WALL_TARGET_MM + WALL_STOP_LEAD_MM + wallSpeedMmS * WALL_STOP_LATENCY_S, 0);
+    Serial.println(F(" mm"));
+    enterQuarantineStop(); return;
+  }
 
   float remain = (float)tofFiltMm - QUARANTINE_WALL_TARGET_MM;
   if (state == S_WALL_APPROACH && remain <= WALL_FINE_ZONE_MM) enterState(S_WALL_FINE_APPROACH);
@@ -1810,7 +1833,7 @@ void benchStart(BenchMode m) {
   state = S_BENCH_TEST;
   stateStartMs = benchT0;
   if (m == BM_MOTOR) {
-    Serial.println(F("\n[BENCH] MOTOR TEST in 2 s: each wheel spins alone, FORWARD then BACKWARD, 1 s at 150 PWM."));
+    Serial.println(F("\n[BENCH] MOTOR TEST in 2 s: each wheel spins alone, FORWARD then BACKWARD, 1 s at 180 PWM."));
     Serial.println(F("[BENCH] ROBOT MUST BE ON BLOCKS. Send any key to abort. Watch which way each wheel really turns."));
   } else if (m == BM_ENC) {
     noInterrupts(); benchTicks0 = (long)encEdgesL; benchB0 = (long)encEdgesR; interrupts();   // reused as start counts
@@ -2070,7 +2093,7 @@ void loop() {
       unsigned long t = millis();
       unsigned long paused = gap + (t - tPause);
       // stage timeouts do not count the pause; the 120 s MATCH clock deliberately does
-      stateStartMs += paused; moveStartMs += paused; wallStartMs += paused;
+      stateStartMs += paused; moveStartMs += paused; wallStartMs += paused; wallPrevMs += paused;
       driveStartMs = lastLEdgeMs = lastREdgeMs = t;
       veerSinceMs = 0;
       lastControlMs = t;
