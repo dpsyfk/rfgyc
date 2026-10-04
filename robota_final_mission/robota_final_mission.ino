@@ -20,6 +20,17 @@
    (corr DIVIDES the mm-per-count. Multiplying would make 1 mm = 3.5 counts instead of ~12.4 and the robot would
    move only about a third of every commanded distance.)
 
+   IF THE WHEELS DO NOT MOVE  (the problem this version is built to settle)
+     Boot log line  [MOTORS] map ... source=default|saved   shows which PWM/DIR pins are used.
+     Serial commands (115200), accepted during the countdown, after a fault, or when done - NEVER while moving:
+        p = WIRING PROBE (robot ON BLOCKS!): tries every PWM/DIR pin combination on D5 D6 D9 D10, watches the encoders,
+            finds which pins drive which wheel and in which direction, adopts that map and SAVES it in EEPROM.
+            If no wheel produces a single encoder count with ANY combination it says so: that is a POWER problem
+            (motor battery / MDD10A B+ B- / common GND / motor leads), not a pin map problem.
+        e = raw encoder monitor (motors off): turn a wheel by hand, its counter must rise
+        z = forget the saved motor map (back to the defaults in the sketch)
+        x = emergency stop
+
    WIRING
      MDD10A  LEFT : PWM D10  DIR D9      RIGHT: PWM D5  DIR D6      common GND
      Encoder LEFT : A D3  B D7           RIGHT: A D2    B D4        VCC 5V
@@ -35,6 +46,7 @@
    ============================================================================ */
 
 #include <Wire.h>
+#include <EEPROM.h>
 #include <Adafruit_VL53L1X.h>
 #include "Arduino_LED_Matrix.h"
 #include <math.h>
@@ -47,13 +59,15 @@ constexpr uint8_t PIN_ENC_L_B = 7;
 constexpr uint8_t PIN_ENC_R_A = 2;
 constexpr uint8_t PIN_ENC_R_B = 4;
 
-constexpr uint8_t PIN_M_L_PWM = 10;
-constexpr uint8_t PIN_M_L_DIR = 9;
-constexpr uint8_t PIN_M_R_PWM = 5;
-constexpr uint8_t PIN_M_R_DIR = 6;
+// DEFAULT motor map = the one of the calibrated jgb37_wifi.ino. The wiring probe ('p') can replace it; the result is kept in
+// EEPROM and loaded at every boot (set USE_SAVED_MOTOR_MAP = false to ignore it, or send 'z' to erase it).
+constexpr uint8_t DEF_L_PWM = 10, DEF_L_DIR = 9, DEF_R_PWM = 5, DEF_R_DIR = 6;
+constexpr int8_t  DEF_L_SIGN = 1, DEF_R_SIGN = 1;      // +1: DIR HIGH moves the wheel forward (= encoder counts go positive)
+constexpr bool    USE_SAVED_MOTOR_MAP = true;
+uint8_t pinLPwm = DEF_L_PWM, pinLDir = DEF_L_DIR, pinRPwm = DEF_R_PWM, pinRDir = DEF_R_DIR;
+int8_t  motorLSign = DEF_L_SIGN, motorRSign = DEF_R_SIGN;
+const char *motorMapSource = "default";
 
-constexpr int8_t MOTOR_L_SIGN = 1;
-constexpr int8_t MOTOR_R_SIGN = 1;
 constexpr int8_t ENC_L_SIGN   = -1;
 constexpr int8_t ENC_R_SIGN   = 1;
 
@@ -87,6 +101,11 @@ constexpr float MM_PER_COUNT_L = 1.0f / COUNTS_PER_MM_L;
 constexpr float MM_PER_COUNT_R = 1.0f / COUNTS_PER_MM_R;
 constexpr int   PWM_MAX = 255;
 constexpr unsigned long CONTROL_DT_MS = 10;
+// Optional motor-battery guard: wire the battery (+) through a divider to an analog pin (e.g. 100k from B+ to A1, 33k from A1 to GND,
+// ratio 4.03) and set BATTERY_SENSE_PIN = A1. -1 = not fitted. The robot then refuses to start below BATTERY_MIN_V.
+constexpr int   BATTERY_SENSE_PIN = -1;
+constexpr float BATTERY_DIV_RATIO = 4.03f;
+constexpr float BATTERY_MIN_V     = 6.0f;
 constexpr float MOVE_END_TOL_MM = 1.0f;       // a move ends when both wheels are within this of the target
 
 // ============================================================================
@@ -163,7 +182,7 @@ constexpr float GYRO_CAL_MAX_HALF_DIFF = 40.0f;
 // ============================================================================
 enum State : uint8_t {
   S_BOOT, S_READY_CHECK, S_COUNTDOWN, S_TURN, S_SETTLE, S_APPROACH,
-  S_FINAL_SETTLE, S_NUDGE, S_SEQ_MOVE, S_SEQ_PAUSE, S_DONE, S_FAULT
+  S_FINAL_SETTLE, S_NUDGE, S_SEQ_MOVE, S_SEQ_PAUSE, S_DONE, S_FAULT, S_BENCH
 };
 
 enum SeqKind : uint8_t { SK_FWD, SK_TURN };
@@ -176,6 +195,7 @@ const char *stateName(State s) {
     case S_FINAL_SETTLE: return "FINAL_SETTLE"; case S_NUDGE: return "NUDGE";
     case S_SEQ_MOVE: return "SEQ_MOVE";       case S_SEQ_PAUSE: return "SEQ_PAUSE";
     case S_DONE: return "DONE";               case S_FAULT: return "FAULT";
+    case S_BENCH: return "BENCH";
   }
   return "?";
 }
@@ -290,8 +310,8 @@ void driveMotor(uint8_t pwmPin, uint8_t dirPin, int8_t sign, float cmd, DirGuard
 }
 void setMotors(float l, float r) {
   lastUL = l; lastUR = r;
-  driveMotor(PIN_M_L_PWM, PIN_M_L_DIR, MOTOR_L_SIGN, l, guardL);
-  driveMotor(PIN_M_R_PWM, PIN_M_R_DIR, MOTOR_R_SIGN, r, guardR);
+  driveMotor(pinLPwm, pinLDir, motorLSign, l, guardL);
+  driveMotor(pinRPwm, pinRDir, motorRSign, r, guardR);
 }
 void stopMotors() { setMotors(0, 0); }
 
@@ -658,7 +678,7 @@ void startMove(float dL, float dR, float v, float acc) {
   mAct = true;
   moveAborted = false;
 }
-void abortMove(const char *why) {
+void abortMove(const String &why) {
   mAct = false;
   stopMotors();
   moveAborted = true;
@@ -688,9 +708,17 @@ void motionTick() {
 
   if (cl != mLastCL) { mLastCL = cl; mMovL = now; }
   if (cr != mLastCR) { mLastCR = cr; mMovR = now; }
-  if ((fabsf(uL) > 60 && now - mMovL > STALL_MS) || (fabsf(uR) > 60 && now - mMovR > STALL_MS)) {
-    abortMove("wheel driven but not turning (encoder / motor / blocked wheel)");
+  bool stallL = (fabsf(uL) > 60 && now - mMovL > STALL_MS), stallR = (fabsf(uR) > 60 && now - mMovR > STALL_MS);
+  if (stallL || stallR) {
+    String why = String("no encoder counts on ") + (stallL ? "LEFT " : "") + (stallR ? "RIGHT " : "") + "wheel while driven at PWM "
+                 + String((int)max(fabsf(uL), fabsf(uR))) + " -> check: MOTOR BATTERY on + MDD10A B+/B- + common GND, motor leads, PWM/DIR wires, "
+                 + "encoder power/wires. Send 'p' (wiring probe, robot on blocks) and 'e' (encoder monitor)";
+    abortMove(why);
     return;
+  }
+  if (t > 0.3f) {                                                    // a wheel running the wrong way would make the PI loop run away
+    if (mFL != 0 && posL * mFL < -15.0f) { abortMove("LEFT wheel moves OPPOSITE to the command (motor direction sign wrong) -> send 'p'"); return; }
+    if (mFR != 0 && posR * mFR < -15.0f) { abortMove("RIGHT wheel moves OPPOSITE to the command (motor direction sign wrong) -> send 'p'"); return; }
   }
   if (t > pT && fabsf(eL) < MOVE_END_TOL_MM && fabsf(eR) < MOVE_END_TOL_MM) { stopMotors(); mAct = false; }
   else if (t > pT + 2.0f) { stopMotors(); mAct = false; }
@@ -999,6 +1027,11 @@ void updateSeqPause(unsigned long now) {
 
 // ---- countdown + readiness ----
 const char *readinessCheck() {
+  if (BATTERY_SENSE_PIN >= 0) {
+    float vb = analogRead((uint8_t)BATTERY_SENSE_PIN) * (5.0f / 1023.0f) * BATTERY_DIV_RATIO;
+    Serial.print(F("[READY] motor battery ")); Serial.print(vb, 1); Serial.println(F(" V"));
+    if (vb < BATTERY_MIN_V) return "MOTOR BATTERY below BATTERY_MIN_V (switch off / unplugged / flat): the wheels cannot move";
+  } else Serial.println(F("[READY] motor battery guard not fitted (BATTERY_SENSE_PIN = -1)"));
   float ffMax = max(KV_L, KV_R) * VMAX_MMPS + max(DEAD_L, DEAD_R);
   if (ffMax > (float)PWM_MAX) return "CALIBRATION: kv x vmax + dead exceeds PWM_MAX (kv in the wrong units? expected ~0.88 PWM per mm/s)";
   if (MOVE_SPEED_MMPS > VMAX_MMPS || TURN_SPEED_MMPS > VMAX_MMPS) return "CALIBRATION: move / turn speed is above vmax";
@@ -1025,6 +1058,7 @@ void updateCountdown(unsigned long now) {
   if (el >= BOOT_DELAY_MS) { if (USE_WALL_MISSION) startTurn(); else startSequence(); }
 }
 
+void updateBench(unsigned long now);
 void missionUpdate(unsigned long now) {
   switch (state) {
     case S_COUNTDOWN:    updateCountdown(now); break;
@@ -1035,6 +1069,7 @@ void missionUpdate(unsigned long now) {
     case S_NUDGE:        updateNudge(); break;
     case S_SEQ_MOVE:     updateSeqMove(now); break;
     case S_SEQ_PAUSE:    updateSeqPause(now); break;
+    case S_BENCH:        updateBench(now); break;
     default: break;
   }
 }
@@ -1044,6 +1079,7 @@ void missionUpdate(unsigned long now) {
 // ============================================================================
 void printTelemetry(unsigned long now) {
   bool moving = (state == S_TURN || state == S_APPROACH || state == S_NUDGE || state == S_SEQ_MOVE);
+  if (state == S_BENCH) return;
   if (now - lastTelemetryMs < (moving ? 250UL : 1000UL)) return;
   lastTelemetryMs = now;
   Serial.print('['); Serial.print(now / 1000.0f, 1); Serial.print(F("s] "));
@@ -1085,9 +1121,174 @@ void renderMatrix(unsigned long now) {
   matrix.renderBitmap(ledFrame, 8, 12);
 }
 
+// ============================================================================
+// MOTOR MAP (EEPROM) + BENCH TOOLS
+// ============================================================================
+constexpr uint8_t MAP_MAGIC = 0xA7;
+static bool isMotorPin(uint8_t p) { return p == 5 || p == 6 || p == 9 || p == 10; }   // the PWM-capable pins the MDD10A can be wired to
+void saveMotorMap() {
+  uint8_t b[7] = { pinLPwm, pinLDir, pinRPwm, pinRDir, (uint8_t)(motorLSign > 0 ? 1 : 0), (uint8_t)(motorRSign > 0 ? 1 : 0), 0 };
+  b[6] = (uint8_t)(b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5] ^ MAP_MAGIC);
+  EEPROM.write(0, MAP_MAGIC);
+  for (uint8_t i = 0; i < 7; i++) EEPROM.write(1 + i, b[i]);
+}
+bool loadMotorMap() {
+  if (EEPROM.read(0) != MAP_MAGIC) return false;
+  uint8_t b[7];
+  for (uint8_t i = 0; i < 7; i++) b[i] = EEPROM.read(1 + i);
+  if (b[6] != (uint8_t)(b[0] ^ b[1] ^ b[2] ^ b[3] ^ b[4] ^ b[5] ^ MAP_MAGIC)) return false;
+  for (uint8_t i = 0; i < 4; i++) if (!isMotorPin(b[i])) return false;
+  if (b[0] == b[1] || b[0] == b[2] || b[0] == b[3] || b[1] == b[2] || b[1] == b[3] || b[2] == b[3]) return false;
+  pinLPwm = b[0]; pinLDir = b[1]; pinRPwm = b[2]; pinRDir = b[3];
+  motorLSign = b[4] ? 1 : -1; motorRSign = b[5] ? 1 : -1;
+  return true;
+}
+void printMotorMap() {
+  Serial.print(F("[MOTORS] map: LEFT PWM=D")); Serial.print(pinLPwm); Serial.print(F(" DIR=D")); Serial.print(pinLDir);
+  Serial.print(F(" sign ")); Serial.print((int)motorLSign);
+  Serial.print(F(" | RIGHT PWM=D")); Serial.print(pinRPwm); Serial.print(F(" DIR=D")); Serial.print(pinRDir);
+  Serial.print(F(" sign ")); Serial.print((int)motorRSign);
+  Serial.print(F("   source=")); Serial.println(motorMapSource);
+}
+
+enum BenchMode : uint8_t { BM_NONE, BM_PROBE, BM_ENC };
+BenchMode benchMode = BM_NONE;
+unsigned long benchT0 = 0, benchLastPrint = 0;
+uint16_t probeStep = 0;                                  // 0 = start delay, then 24 runs of (run, pause): 12 pin pairs x DIR low/high
+long probeCnt[12][2][2];                                 // [pair][DIR level 0/1][wheel 0=L 1=R] = encoder counts during the run
+uint8_t probeA[12], probeB[12];                          // pair k: PWM on pin A, level on pin B
+long probeStartL = 0, probeStartR = 0, benchEnc0L = 0, benchEnc0R = 0;
+constexpr unsigned long PROBE_START_DELAY_MS = 4000, PROBE_RUN_MS = 220, PROBE_PAUSE_MS = 280;
+constexpr int  PROBE_PWM = 200;
+constexpr long PROBE_MIN_COUNTS = 25;                    // a wheel counts as "moved" above this many counts
+
+static void pinLowOut(uint8_t pin) { pinMode(pin, OUTPUT); digitalWrite(pin, LOW); }   // pinMode also releases a pin that was used for PWM
+void benchFinish(const char *why) {
+  stopMotors();
+  const uint8_t P[4] = {5, 6, 9, 10};
+  for (uint8_t i = 0; i < 4; i++) pinLowOut(P[i]);
+  benchMode = BM_NONE;
+  guardL = DirGuard(); guardR = DirGuard();
+  Serial.print(F("[BENCH] ")); Serial.print(why);
+  Serial.println(F(". Motors off. Press RESET to run the mission (it loads the saved motor map). 'p' / 'e' repeat a tool."));
+}
+
+void benchStart(BenchMode m) {
+  stopMotors();
+  benchMode = m; benchT0 = millis(); benchLastPrint = benchT0; probeStep = 0;
+  state = S_BENCH; stateMs = benchT0;
+  if (m == BM_PROBE) {
+    uint8_t n = 0; const uint8_t P[4] = {5, 6, 9, 10};
+    for (uint8_t a = 0; a < 4; a++) for (uint8_t b = 0; b < 4; b++) if (a != b) { probeA[n] = P[a]; probeB[n] = P[b]; n++; }
+    for (uint8_t k = 0; k < 12; k++) probeCnt[k][0][0] = probeCnt[k][0][1] = probeCnt[k][1][0] = probeCnt[k][1][1] = 0;
+    Serial.println(F("\n[PROBE] WIRING PROBE starts in 4 s. ROBOT MUST BE ON BLOCKS (wheels free): every PWM/DIR pin combination of D5 D6 D9 D10"));
+    Serial.println(F("[PROBE] is pulsed for 0.2 s while the encoders are watched. Takes ~15 s. Any key aborts."));
+  } else {
+    benchEnc0L = getL(); benchEnc0R = getR();
+    Serial.println(F("\n[ENC] ENCODER MONITOR (motors off): turn each wheel by hand, forward and backward. Any key stops it."));
+  }
+}
+
+void probeAnalyse() {
+  Serial.println(F("[PROBE] result table  (counts while pulsed: DIR low / DIR high)"));
+  int bestL = -1, bestR = -1; long bestLs = 0, bestRs = 0, maxAbs = 0;
+  for (uint8_t k = 0; k < 12; k++) {
+    Serial.print(F("  PWM=D")); Serial.print(probeA[k]); Serial.print(F(" DIR=D")); Serial.print(probeB[k]);
+    Serial.print(F("   LEFT enc ")); Serial.print(probeCnt[k][0][0]); Serial.print('/'); Serial.print(probeCnt[k][1][0]);
+    Serial.print(F("   RIGHT enc ")); Serial.print(probeCnt[k][0][1]); Serial.print('/'); Serial.println(probeCnt[k][1][1]);
+    for (uint8_t w = 0; w < 2; w++) {
+      long lo = probeCnt[k][0][w], hi = probeCnt[k][1][w];
+      if (labs(lo) > maxAbs) maxAbs = labs(lo);
+      if (labs(hi) > maxAbs) maxAbs = labs(hi);
+      long strength = min(labs(lo), labs(hi));
+      bool good = (labs(lo) >= PROBE_MIN_COUNTS && labs(hi) >= PROBE_MIN_COUNTS && ((lo < 0) != (hi < 0)));   // moves AND reverses with DIR
+      if (good && w == 0 && strength > bestLs) { bestLs = strength; bestL = k; }
+      if (good && w == 1 && strength > bestRs) { bestRs = strength; bestR = k; }
+    }
+  }
+  if (maxAbs < 10) {
+    Serial.println(F("[PROBE] NO ENCODER COUNT AT ALL for ANY pin combination."));
+    Serial.println(F("        If the wheels did NOT turn: the motors get no power -> motor battery connected + switched ON? MDD10A power LED lit?"));
+    Serial.println(F("        MDD10A B+/B- on the battery, Arduino GND joined to the MDD10A signal GND, motor leads tight in M1A/M1B/M2A/M2B."));
+    Serial.println(F("        If the wheels DID turn: the encoders are dead -> encoder VCC/GND, A wires on D3 (left) and D2 (right)."));
+    return;
+  }
+  if (bestL >= 0 && bestR >= 0 && probeA[bestL] != probeA[bestR] && probeA[bestL] != probeB[bestR] && probeB[bestL] != probeA[bestR] && probeB[bestL] != probeB[bestR]) {
+    pinLPwm = probeA[bestL]; pinLDir = probeB[bestL]; motorLSign = (probeCnt[bestL][1][0] > 0) ? 1 : -1;
+    pinRPwm = probeA[bestR]; pinRDir = probeB[bestR]; motorRSign = (probeCnt[bestR][1][1] > 0) ? 1 : -1;
+    motorMapSource = "probe";
+    saveMotorMap();
+    Serial.println(F("[PROBE] FOUND both wheels. Adopted and SAVED to EEPROM:"));
+    printMotorMap();
+    Serial.println(F("        (sign -1 = DIR HIGH moves that wheel backwards, so the sketch drives it with the opposite level)"));
+    Serial.println(F("        Put these four numbers into DEF_L_PWM / DEF_L_DIR / DEF_R_PWM / DEF_R_DIR if you want them in the source too."));
+    Serial.println(F("        The encoder sign convention (positive counts = forward) is taken from the calibration: on the first run WATCH that the robot drives FORWARD."));
+    return;
+  }
+  Serial.print(F("[PROBE] only partly found: LEFT ")); Serial.print(bestL >= 0 ? F("yes") : F("NO")); Serial.print(F(", RIGHT ")); Serial.println(bestR >= 0 ? F("yes") : F("NO"));
+  Serial.println(F("        The wheel marked NO produced no clean 'moves and reverses with DIR' result: that motor / its driver channel / its DIR wire / its encoder is faulty."));
+  Serial.println(F("        Not saved. Use the table above (a wheel that moves in one DIR column only has a dead DIR wire)."));
+}
+
+void updateBench(unsigned long now) {
+  if (benchMode == BM_NONE) { setMotors(0, 0); return; }
+  if (benchMode == BM_ENC) {
+    if (now - benchLastPrint >= 250) {
+      benchLastPrint = now;
+      Serial.print(F("[ENC] L: A=")); Serial.print(digitalRead(PIN_ENC_L_A)); Serial.print(F(" B=")); Serial.print(digitalRead(PIN_ENC_L_B));
+      Serial.print(F(" counts=")); Serial.print(getL() - benchEnc0L);
+      Serial.print(F(" | R: A=")); Serial.print(digitalRead(PIN_ENC_R_A)); Serial.print(F(" B=")); Serial.print(digitalRead(PIN_ENC_R_B));
+      Serial.print(F(" counts=")); Serial.println(getR() - benchEnc0R);
+    }
+    return;
+  }
+  // ---- wiring probe ----
+  unsigned long el = now - benchT0;
+  if (probeStep == 0) {
+    if (el < PROBE_START_DELAY_MS) return;
+    probeStep = 1; benchT0 = now;
+    const uint8_t P[4] = {5, 6, 9, 10};
+    for (uint8_t i = 0; i < 4; i++) pinLowOut(P[i]);
+    el = 0;
+  }
+  uint16_t run = (probeStep - 1) / 2; bool running = (probeStep % 2) == 1;
+  uint8_t k = run / 2, level = run % 2;
+  if (run >= 24) { probeAnalyse(); benchFinish("probe finished"); return; }
+  if (running) {
+    static uint16_t startedStep = 0xFFFF;
+    if (startedStep != probeStep) {                     // first call of this run
+      startedStep = probeStep;
+      probeStartL = getL(); probeStartR = getR();
+      const uint8_t P[4] = {5, 6, 9, 10};
+      for (uint8_t i = 0; i < 4; i++) pinLowOut(P[i]);
+      digitalWrite(probeB[k], level ? HIGH : LOW);
+      analogWrite(probeA[k], PROBE_PWM);
+    }
+    if (el >= PROBE_RUN_MS) {
+      analogWrite(probeA[k], 0);
+      pinLowOut(probeA[k]); pinLowOut(probeB[k]);
+      probeCnt[k][level][0] = getL() - probeStartL;
+      probeCnt[k][level][1] = getR() - probeStartR;
+      probeStep++; benchT0 = now;
+    }
+  } else if (el >= PROBE_PAUSE_MS) { probeStep++; benchT0 = now; }
+}
+
 void serialCommands() {
   while (Serial.available()) {
     char c = Serial.read();
+    if (c == '\r' || c == '\n' || c == ' ') continue;
+    if (state == S_BENCH && benchMode != BM_NONE) { benchFinish("aborted by serial input"); continue; }
+    if (c == 'p' || c == 'P' || c == 'e' || c == 'E') {
+      if (state == S_COUNTDOWN || state == S_FAULT || state == S_DONE || state == S_BENCH) benchStart((c == 'p' || c == 'P') ? BM_PROBE : BM_ENC);
+      else Serial.println(F("[CMD] refused: send p / e only during the countdown, after a fault, or when done (never while moving)"));
+      continue;
+    }
+    if (c == 'z' || c == 'Z') {
+      EEPROM.write(0, 0);
+      Serial.println(F("[MOTORS] saved motor map erased - reset to use the sketch defaults"));
+      continue;
+    }
     if ((c == 'x' || c == 'X' || c == 's' || c == 'S') && state != S_FAULT && state != S_DONE) fault("emergency stop from serial");
   }
 }
@@ -1097,8 +1298,10 @@ void serialCommands() {
 // ============================================================================
 void setup() {
   // motors OFF first (this also claims the PWM timers before the LED matrix starts)
-  pinMode(PIN_M_L_PWM, OUTPUT); pinMode(PIN_M_L_DIR, OUTPUT);
-  pinMode(PIN_M_R_PWM, OUTPUT); pinMode(PIN_M_R_DIR, OUTPUT);
+  { const uint8_t P[4] = {5, 6, 9, 10}; for (uint8_t i = 0; i < 4; i++) pinLowOut(P[i]); }   // every candidate motor pin LOW first
+  if (USE_SAVED_MOTOR_MAP && loadMotorMap()) motorMapSource = "saved (EEPROM)";
+  pinMode(pinLPwm, OUTPUT); pinMode(pinLDir, OUTPUT);
+  pinMode(pinRPwm, OUTPUT); pinMode(pinRDir, OUTPUT);
   stopMotors();
 
   Serial.begin(115200);
@@ -1112,6 +1315,7 @@ void setup() {
   pinMode(PIN_ENC_R_A, INPUT_PULLUP); pinMode(PIN_ENC_R_B, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_L_A), isrL, CHANGE);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_R_A), isrR, CHANGE);
+  printMotorMap();
   Serial.println(F("[INIT] encoders attached (L: D3/D7, R: D2/D4)"));
   showStage(3);
 
