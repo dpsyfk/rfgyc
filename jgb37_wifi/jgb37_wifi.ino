@@ -38,6 +38,11 @@
 #include <WiFiS3.h>
 #include <math.h>
 
+// Types used in function signatures MUST be declared before any function: the Arduino IDE inserts its automatic
+// prototypes at the top of the file, so a struct defined further down is 'not declared' there.
+struct DirGuard { int8_t dir = 0; unsigned long zeroSince = 0; };
+struct ScanInfo { int steps; int lanes; float dist; float timeS; float wc; float lc; float pitch; };
+
 // ============================ USER CONFIG ===================================
 #define AP_SSID "JGB37-Robot"
 #define AP_PASS "12345678"          // at least 8 characters
@@ -148,7 +153,6 @@ float mmPerCountR() { return (PI * S.wheelDiam / S.cprR) * S.corrR; }
 // A wheel never changes direction while it is driven: it must pass through zero output for REVERSE_NEUTRAL_MS first,
 // and DIR is only written when PWM is about to be non-zero (MDD10A protection).
 #define REVERSE_NEUTRAL_MS 60
-struct DirGuard { int8_t dir = 0; unsigned long zeroSince = 0; };
 DirGuard guardL, guardR;
 void driveMotor(int pwmPin, int dirPin, int sign, float cmd, DirGuard &g) {
   int p = (int)constrain(cmd * sign, -PWM_MAX, PWM_MAX);
@@ -315,7 +319,6 @@ void beginQueue() { qI = 0; qWait = (qN > 0); qNextAt = millis(); }
 // ============================ SCAN PLANNER (Z) ==============================
 // Plans in the robot's frame at the moment Z starts: x forward, y LEFT, heading 0 = forward, +deg = left.
 // Every move is axis-aligned, so the planner only needs headings of 0 / +-90 / 180.
-struct ScanInfo { int steps; int lanes; float dist; float timeS; float wc; float lc; float pitch; };
 static float plX, plY, plTh;
 static bool plCommit;
 static const char *scanErr = nullptr;
