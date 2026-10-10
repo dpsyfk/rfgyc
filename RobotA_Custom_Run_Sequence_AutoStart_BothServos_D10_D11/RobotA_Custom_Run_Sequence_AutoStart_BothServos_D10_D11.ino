@@ -87,8 +87,16 @@ volatile long rightEncoderCount = 0;
 // =====================================================
 // MOTOR DIRECTIONS
 // =====================================================
-const bool LEFT_FORWARD_DIR  = LOW;
+const bool LEFT_FORWARD_DIR  = LOW;   // factory defaults (same as the proven GateOpen_D10 sketch)
 const bool RIGHT_FORWARD_DIR = HIGH;
+// Live levels actually used by the motor code. They equal the defaults unless a
+// FLIPL / FLIPR command was saved (stored in EEPROM at DIR_EEPROM_ADDR, far from
+// the calibration block at address 0, which is untouched).
+bool leftForwardLevel  = LEFT_FORWARD_DIR;
+bool rightForwardLevel = RIGHT_FORWARD_DIR;
+struct DirConfig { uint32_t magic; uint8_t flipLeft; uint8_t flipRight; uint8_t pad[2]; };
+const uint32_t DIR_MAGIC = 0x44495231UL;
+const int DIR_EEPROM_ADDR = 1024;
 
 // =====================================================
 // CALIBRATION v2.4: fourth physical test on v2.3.
@@ -396,7 +404,7 @@ void setLeftMotor(int pwm, bool forward)
 {
   digitalWrite(
     LEFT_DIR,
-    forward ? LEFT_FORWARD_DIR : !LEFT_FORWARD_DIR
+    forward ? leftForwardLevel : !leftForwardLevel
   );
 
   analogWrite(
@@ -409,7 +417,7 @@ void setRightMotor(int pwm, bool forward)
 {
   digitalWrite(
     RIGHT_DIR,
-    forward ? RIGHT_FORWARD_DIR : !RIGHT_FORWARD_DIR
+    forward ? rightForwardLevel : !rightForwardLevel
   );
 
   analogWrite(
@@ -973,11 +981,48 @@ void showHelp()
 
   sendLine("SENSORS   Legacy analog diagnostics; autonomous alignment uses digital A1/A2/A3");
 
+  sendLine("DIRTEST | DIRSHOW | FLIPL | FLIPR | DIRRESET  (wheel direction check / saved fix)");
   sendLine("STOP      Stop immediately");
 
   sendLine("HELP");
 
   sendLine();
+}
+
+void loadDirConfig() {
+  DirConfig d; EEPROM.get(DIR_EEPROM_ADDR, d);
+  if (d.magic == DIR_MAGIC && d.flipLeft <= 1 && d.flipRight <= 1) {
+    leftForwardLevel  = d.flipLeft  ? !LEFT_FORWARD_DIR  : LEFT_FORWARD_DIR;
+    rightForwardLevel = d.flipRight ? !RIGHT_FORWARD_DIR : RIGHT_FORWARD_DIR;
+  }
+}
+void saveDirConfig() {
+  DirConfig d; memset(&d, 0, sizeof(d));
+  d.magic = DIR_MAGIC;
+  d.flipLeft  = (leftForwardLevel  != LEFT_FORWARD_DIR)  ? 1 : 0;
+  d.flipRight = (rightForwardLevel != RIGHT_FORWARD_DIR) ? 1 : 0;
+  EEPROM.put(DIR_EEPROM_ADDR, d);
+}
+void showDir() {
+  sendLine(String("DIR LEFT_fwd_level=")+(leftForwardLevel?"HIGH":"LOW")+(leftForwardLevel!=LEFT_FORWARD_DIR?" (FLIPPED)":" (default)")+
+           " RIGHT_fwd_level="+(rightForwardLevel?"HIGH":"LOW")+(rightForwardLevel!=RIGHT_FORWARD_DIR?" (FLIPPED)":" (default)"));
+}
+// Spins ONE wheel forward at a time for 1 s so you can see which one is reversed.
+// Lift the wheels first. Send STOP before this (the route auto-starts 500 ms after boot).
+void dirTest() {
+  stopRequested = false; stopMotors(); delay(NEUTRAL_MS);
+  sendLine("DIRTEST: LEFT wheel FORWARD for 1 s");
+  setLeftMotor(70, true);
+  unsigned long t = millis();
+  while (!stopRequested && millis()-t < 1000UL) { serviceWiFiDuringMotion(); serviceSerialStopDuringMotion(); delay(5); }
+  stopMotors(); delay(400);
+  if (stopRequested) { sendLine("DIRTEST stopped"); return; }
+  sendLine("DIRTEST: RIGHT wheel FORWARD for 1 s");
+  setRightMotor(70, true);
+  t = millis();
+  while (!stopRequested && millis()-t < 1000UL) { serviceWiFiDuringMotion(); serviceSerialStopDuringMotion(); delay(5); }
+  stopMotors();
+  sendLine("DIRTEST done. If a wheel went BACKWARD send FLIPL or FLIPR (saved permanently).");
 }
 
 // Opens one gate immediately (no delay): motors stopped, servo pulsed open for
@@ -1133,6 +1178,12 @@ void processCommand(String command)
     return;
   }
 
+  if (command == "DIRTEST") { dirTest(); return; }
+  if (command == "DIRSHOW") { showDir(); return; }
+  if (command == "FLIPL") { leftForwardLevel  = !leftForwardLevel;  saveDirConfig(); showDir(); return; }
+  if (command == "FLIPR") { rightForwardLevel = !rightForwardLevel; saveDirConfig(); showDir(); return; }
+  if (command == "DIRRESET") { leftForwardLevel = LEFT_FORWARD_DIR; rightForwardLevel = RIGHT_FORWARD_DIR; saveDirConfig(); showDir(); return; }
+
   // ---------------------------------------------
   // SENSOR
   // ---------------------------------------------
@@ -1269,6 +1320,16 @@ void setup()
   pinMode(RIGHT_DIR, OUTPUT);
 
   stopMotors();
+  loadDirConfig();
+
+  // Gate servos are attached ONCE here, before any movement. On the UNO R4 a servo
+  // attach claims a hardware timer; doing it mid-route could disturb the motor PWM.
+  rightGateServo.attach(RIGHT_GATE_SERVO_PIN);
+  rightGateServo.writeMicroseconds(RIGHT_GATE_NEUTRAL_US);
+  rightGateServoAttached = true;
+  leftGateServo.attach(LEFT_GATE_SERVO_PIN);
+  leftGateServo.writeMicroseconds(LEFT_GATE_NEUTRAL_US);
+  leftGateServoAttached = true;
 
   // Encoders
   pinMode(LEFT_ENC_A, INPUT_PULLUP);
